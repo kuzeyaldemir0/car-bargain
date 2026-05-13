@@ -1,0 +1,6 @@
+urls.txt
+cars.csv
+.venv/
+__pycache__/
+*.pyc
+.idea/
