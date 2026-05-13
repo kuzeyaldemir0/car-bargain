@@ -1,13 +1,31 @@
 import asyncio
-import random
 import csv
 import os
-from playwright.async_api import async_playwright
+from urllib.parse import urlparse
 from bs4 import BeautifulSoup
+import httpx
 
 INPUT_FILE = "urls.txt"
 OUTPUT_FILE = "cars.csv"
-CONCURRENCY = 20
+FAILED_FILE = "failed_urls.txt"
+UNAVAILABLE_FILE = "unavailable_urls.txt"
+
+CONCURRENCY = 100
+REQUESTS_PER_MINUTE = 450
+REQUEST_TIMEOUT = 12
+MAX_RETRIES = 3
+WRITE_BATCH_SIZE = 100
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Cache-Control": "no-cache",
+}
 
 FIELDS = ["url", "price", "brand", "series", "model", "year", "mileage",
           "transmission", "fuel", "body", "color", "engine", "hp", "drive",
@@ -59,27 +77,129 @@ def parse_listing(html, url):
     return data
 
 
-async def scrape_url(semaphore, browser, url):
-    async with semaphore:
-        page = await browser.new_page()
-        for attempt in range(3):
+def has_listing_data(data):
+    return bool(data.get("price") or data.get("brand") or data.get("model"))
+
+
+def is_listing_detail_url(url):
+    return urlparse(str(url)).path.startswith("/ilan/")
+
+
+class RateLimiter:
+    def __init__(self, max_requests, period):
+        self.interval = period / max_requests
+        self.next_request_at = 0
+        self.lock = asyncio.Lock()
+
+    async def wait(self):
+        async with self.lock:
+            loop = asyncio.get_running_loop()
+            now = loop.time()
+            wait_for = max(0, self.next_request_at - now)
+            self.next_request_at = max(now, self.next_request_at) + self.interval
+
+        if wait_for:
+            await asyncio.sleep(wait_for)
+
+
+async def fetch_listing(client, limiter, url):
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            await limiter.wait()
+            response = await client.get(url)
+            if response.status_code in {404, 410}:
+                return None, "unavailable"
+            response.raise_for_status()
+
+            if not is_listing_detail_url(response.url):
+                return None, "unavailable"
+
+            data = parse_listing(response.text, url)
+            if not has_listing_data(data):
+                raise ValueError("listing markers not found in response")
+
+            return data, None
+        except Exception:
+            await asyncio.sleep(min(2 ** attempt, 10))
+
+    return None, "failed"
+
+
+async def flush_rows(batch, csvfile, writer, write_lock, counters):
+    if not batch:
+        return
+
+    async with write_lock:
+        writer.writerows(batch)
+        csvfile.flush()
+        counters["written"] += len(batch)
+    batch.clear()
+
+
+async def write_failed_url(url, failedfile, failure_lock, counters):
+    async with failure_lock:
+        failedfile.write(url + "\n")
+        failedfile.flush()
+        counters["failed"] += 1
+
+
+async def write_unavailable_url(url, unavailablefile, unavailable_lock, counters):
+    async with unavailable_lock:
+        unavailablefile.write(url + "\n")
+        unavailablefile.flush()
+        counters["unavailable"] += 1
+
+
+async def worker(
+    queue,
+    client,
+    limiter,
+    csvfile,
+    failedfile,
+    unavailablefile,
+    writer,
+    write_lock,
+    failure_lock,
+    unavailable_lock,
+    counters,
+):
+    batch = []
+
+    try:
+        while True:
+            url = await queue.get()
             try:
-                await page.goto(url, timeout=8000)
-                await page.wait_for_load_state("domcontentloaded")
-                data = parse_listing(await page.content(), url)
-                await asyncio.sleep(random.uniform(0.5, 1.5))
-                await page.close()
-                return data
-            except Exception as e:
-                print(f"  Attempt {attempt + 1} failed ({url}): {e}")
-                await asyncio.sleep(5)
-        await page.close()
-        return None
+                if url is None:
+                    break
+
+                data, error_type = await fetch_listing(client, limiter, url)
+                if data:
+                    batch.append(data)
+                elif error_type == "unavailable":
+                    await write_unavailable_url(url, unavailablefile, unavailable_lock, counters)
+                else:
+                    await write_failed_url(url, failedfile, failure_lock, counters)
+
+                counters["processed"] += 1
+                if counters["processed"] % 100 == 0:
+                    print(
+                        f"[{counters['processed']}/{counters['total']}] processed | "
+                        f"{counters['written']} written | "
+                        f"{counters['unavailable']} unavailable | "
+                        f"{counters['failed']} failed"
+                    )
+
+                if len(batch) >= WRITE_BATCH_SIZE:
+                    await flush_rows(batch, csvfile, writer, write_lock, counters)
+            finally:
+                queue.task_done()
+    finally:
+        await flush_rows(batch, csvfile, writer, write_lock, counters)
 
 
 async def main():
     with open(INPUT_FILE) as f:
-        urls = [line.strip() for line in f if line.strip()]
+        urls = list(dict.fromkeys(line.strip() for line in f if line.strip()))
 
     scraped = set()
     if os.path.exists(OUTPUT_FILE):
@@ -90,29 +210,94 @@ async def main():
 
     urls = [u for u in urls if u not in scraped]
     print(f"Resuming: {len(scraped)} already scraped, {len(urls)} remaining")
+    print(
+        f"HTTP scraper: concurrency={CONCURRENCY}, "
+        f"limit={REQUESTS_PER_MINUTE}/minute, retries={MAX_RETRIES}"
+    )
 
-    semaphore = asyncio.Semaphore(CONCURRENCY)
+    if not urls:
+        print(f"Done. Saved to {OUTPUT_FILE}")
+        return
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+    queue = asyncio.Queue()
+    for url in urls:
+        queue.put_nowait(url)
 
-        file_exists = os.path.exists(OUTPUT_FILE)
-        with open(OUTPUT_FILE, "a", newline="", encoding="utf-8") as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=FIELDS)
-            if not file_exists:
-                writer.writeheader()
+    file_exists = os.path.exists(OUTPUT_FILE) and os.path.getsize(OUTPUT_FILE) > 0
+    limits = httpx.Limits(max_connections=CONCURRENCY, max_keepalive_connections=CONCURRENCY)
+    timeout = httpx.Timeout(REQUEST_TIMEOUT)
+    limiter = RateLimiter(REQUESTS_PER_MINUTE, 60)
+    write_lock = asyncio.Lock()
+    failure_lock = asyncio.Lock()
+    unavailable_lock = asyncio.Lock()
+    counters = {
+        "processed": 0,
+        "written": 0,
+        "unavailable": 0,
+        "failed": 0,
+        "total": len(urls),
+    }
 
-            tasks = [scrape_url(semaphore, browser, url) for url in urls]
-            for i, coro in enumerate(asyncio.as_completed(tasks)):
-                result = await coro
-                if result:
-                    writer.writerow(result)
-                if (i + 1) % 100 == 0:
-                    print(f"[{i + 1}/{len(urls)}] scraped")
+    with (
+        open(OUTPUT_FILE, "a", newline="", encoding="utf-8") as csvfile,
+        open(FAILED_FILE, "w", encoding="utf-8") as failedfile,
+        open(UNAVAILABLE_FILE, "w", encoding="utf-8") as unavailablefile,
+    ):
+        writer = csv.DictWriter(csvfile, fieldnames=FIELDS)
+        if not file_exists:
+            writer.writeheader()
 
-        await browser.close()
+        async with httpx.AsyncClient(
+            headers=HEADERS,
+            follow_redirects=True,
+            limits=limits,
+            timeout=timeout,
+        ) as client:
+            tasks = [
+                asyncio.create_task(
+                    worker(
+                        queue,
+                        client,
+                        limiter,
+                        csvfile,
+                        failedfile,
+                        unavailablefile,
+                        writer,
+                        write_lock,
+                        failure_lock,
+                        unavailable_lock,
+                        counters,
+                    )
+                )
+                for i in range(min(CONCURRENCY, len(urls)))
+            ]
+
+            try:
+                await queue.join()
+            except asyncio.CancelledError:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
+            else:
+                for _ in tasks:
+                    queue.put_nowait(None)
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+    if counters["failed"]:
+        print(f"Saved {counters['failed']} failed URLs to {FAILED_FILE}")
+    if counters["unavailable"]:
+        print(f"Saved {counters['unavailable']} unavailable URLs to {UNAVAILABLE_FILE}")
 
     print(f"Done. Saved to {OUTPUT_FILE}")
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print(
+            f"\nInterrupted. Completed rows are in {OUTPUT_FILE}; "
+            f"failed URLs so far are in {FAILED_FILE}; "
+            f"unavailable URLs so far are in {UNAVAILABLE_FILE}."
+        )

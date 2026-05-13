@@ -1,5 +1,8 @@
 urls.txt
 cars.csv
+failed_urls.txt
+unavailable_urls.txt
+storage/
 .venv/
 __pycache__/
 *.pyc
