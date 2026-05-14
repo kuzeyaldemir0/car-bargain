@@ -9,8 +9,10 @@ The current goal is not to produce a production-grade valuation model yet. It is
 - `collect_urls.py` collects listing URLs by brand and writes them to `urls.txt`.
 - `scrape_listings.py` visits the listing pages and writes structured listing data to `cars.csv`.
 - `model.ipynb` cleans the data, trains baseline models, tunes selected models, and ranks potential bargains.
-- `cars.csv` is the scraped dataset used by the notebook.
+- `cars.csv` is the scraped dataset used by the notebook. It is not tracked in this repository; recreate it locally by running the scrapers.
 - `failed_urls.txt` and `unavailable_urls.txt` record URLs that could not be scraped successfully.
+
+The scrapers respect rate limits and do not bypass authentication or paywalls. The scraped dataset is intentionally not redistributed in this repository; anyone wanting to reproduce the project can regenerate it by running the included scripts against the public listing pages.
 
 ## Dataset
 
@@ -80,9 +82,17 @@ A LightGBM MAE of roughly `87k TL` is a meaningful improvement over the earlier 
 
 This error is still large enough that the bargain finder should be treated as a candidate generator, not as proof that a listing is underpriced. A high predicted discount may indicate a real bargain, but it can also come from missing features, rare models, unusual mileage, data quality issues, or model uncertainty. The bargain finder now ranks listings by `discount_pct` (the predicted discount as a fraction of the predicted price) rather than by absolute Turkish lira, which prevents expensive luxury cars and EVs from dominating the top of the list purely because they have larger absolute prediction errors.
 
-## Possible Next Steps
+## Limitations
 
-- Build a small UI so the bargain finder can be browsed without opening the notebook.
+A few characteristics of the model and the data are worth being explicit about, because they shape how the bargain finder output should be read.
+
+- **Cheap-car bias from percentage ranking.** Mean absolute error is roughly constant in absolute Turkish lira, so the same prediction error becomes a much larger percentage on a `200k TL` car than on a `5M TL` car. As a result, the listings sorted to the top by `discount_pct` are systematically biased toward inexpensive cars. The fix is to either filter by a minimum predicted price, or to read both `discount` and `discount_pct` together rather than relying on the percentage alone.
+- **Sparse data on rare and old cars.** The model performs noticeably worse on `brand_series` values with few training rows and on cars older than roughly the year 2000. In both cases, the model tends to over-predict the price, which can make a normal listing look like a deep bargain when it is actually just an unfamiliar segment for the model.
+- **No trim awareness.** Within a `brand_series`, the model cannot distinguish between trim levels (for example a base versus a top-trim engine variant). This is the single largest remaining source of unmodeled variance in the dataset.
+- **Sold listings redirect rather than 404.** Arabam.com redirects expired or sold listings to a category page rather than returning a not-found error. A bargain link that opens to a category or search page almost always means the car has already been sold.
+
+## Future Work
+
 - Parse the free-text `model` column for trim level. Within a `brand_series`, trim often determines a large fraction of price (for example a base versus a top-trim engine variant), so this is the largest remaining unmodeled source of variance.
 - Add prediction intervals via quantile regression (training one LightGBM with `objective="quantile"` and `alpha=0.1` and another with `alpha=0.9`) so the bargain finder can prefer listings where the model is confident, rather than listings where the discount is large but the model is uncertain.
 - Re-run `RandomizedSearchCV` on the current twelve-feature set to confirm the baseline LightGBM result cannot be improved much by tuning at this stage.
