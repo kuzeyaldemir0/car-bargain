@@ -22,15 +22,20 @@ The dataset currently contains `42,267` CSV rows including the header. The main 
 - Damage and condition signals: `heavy_damage`, `paint_changed`
 - Target: `price`
 
-The current model uses a small feature set:
+The current model uses the following feature set:
 
 - `brand_series_encoded`
 - `year`
 - `mileage`
 - `heavy_damage_encoded`
-X- `hp`
+- `hp`
+- `degisen` (number of replaced panels)
+- `boyali` (number of painted panels)
+- `lokal_boyali` (number of locally painted panels)
 
 `hp` is parsed from strings like `"110 hp"` and bucketed ranges like `"101 - 125 HP"` (arabam.com's fixed 25-hp buckets). Exact values are converted directly; range values are replaced with the midpoint. Open-ended ranges and placeholder values such as `"50 HP'ye kadar"`, `"601 HP ve üzeri"`, and `"-"` cannot be parsed cleanly and become `NaN`, which is then dropped.
+
+`paint_changed` is parsed into the three numeric count columns above. Strings such as `"1 değişen, 2 boyalı"` or `"3 boyalı, 1 lokal boyalı"` are split with regex and the leading numbers extracted into the matching column. `"Tamamı orjinal"` (fully original) maps to `(0, 0, 0)`. `"Tamamı boyalı"` and `"Tamamı lokal boyalı"` are treated as 12 painted or 12 locally painted panels respectively, since 12 panels is roughly a full body and matches values seen elsewhere in the data. Rows with `NaN` or `"Belirtilmemiş"` (unspecified) are dropped because they carry no signal.
 
 ## Cleaning and Modeling Workflow
 
@@ -44,52 +49,40 @@ The notebook currently:
 6. Filters unrealistic years and mileages.
 7. Fills missing `heavy_damage` values with `Belirtilmemiş`.
 8. Parses `hp` strings into a single numeric value, taking the midpoint for bucketed ranges, and drops rows that cannot be parsed.
-9. Combines `brand` and `series` into `brand_series`.
-10. Label-encodes `brand_series` and `heavy_damage`.
-11. Splits the data into train and test sets with `random_state=42`.
-12. Trains baseline Decision Tree, XGBoost, and LightGBM regressors.
-13. Runs `RandomizedSearchCV` over LightGBM hyperparameters.
-14. Predicts expected prices and ranks listings by predicted discount.
+9. Parses `paint_changed` into `degisen`, `boyali`, and `lokal_boyali` count columns and drops rows with no information.
+10. Combines `brand` and `series` into `brand_series`.
+11. Label-encodes `brand_series` and `heavy_damage`.
+12. Splits the data into train and test sets with `random_state=42`.
+13. Trains baseline Decision Tree, XGBoost, and LightGBM regressors.
+14. Runs `RandomizedSearchCV` over LightGBM hyperparameters.
+15. Predicts expected prices and ranks listings by predicted discount in both absolute Turkish lira and as a percentage of the predicted price.
 
 ## Current Test Results
 
 The current metric is mean absolute error (MAE) in Turkish lira on the held-out test set. Lower is better.
 
+The current metric is mean absolute error (MAE) in Turkish lira on the held-out test set. Lower is better. The results below are with the full eight-feature set described above.
+
 | Model | Test MAE |
 | --- | ---: |
-| Decision Tree baseline | 169,626 TL |
-| XGBoost baseline | 145,543 TL |
-| Tuned XGBoost test result | 143,284 TL |
-| LightGBM baseline | 135,583 TL |
-| Tuned LightGBM test result | 134,991 TL |
+| Decision Tree baseline | 144,875 TL |
+| XGBoost baseline | 103,872 TL |
+| LightGBM baseline | 93,334 TL |
 
-LightGBM is currently the strongest model. The tuned LightGBM search selected:
-
-```python
-{
-    "learning_rate": 0.0133,
-    "max_depth": -1,
-    "min_child_samples": 10,
-    "n_estimators": 1453,
-    "num_leaves": 67,
-}
-```
-
-The LightGBM `RandomizedSearchCV` reported a best cross-validation MAE of `132,615 TL`, but the held-out test MAE is `134,991 TL`. For model-to-model comparison, the test-set result is the fairer number.
+LightGBM is the strongest model. For reference, the same models trained earlier on a smaller four-feature set (without `hp` and the paint count columns) gave Decision Tree `169,626 TL`, XGBoost `145,543 TL`, and LightGBM `135,583 TL`. The roughly `42,000 TL` drop in LightGBM MAE from feature engineering alone was much larger than anything hyperparameter tuning produced on the smaller feature set, where a `RandomizedSearchCV` over LightGBM moved the MAE only a few hundred TL. The tuning has not yet been re-run on the larger feature set.
 
 ## Current Interpretation
 
-The tuned LightGBM MAE of roughly `135k TL` is a useful first result given the model only uses brand/series, year, mileage, heavy damage status, and horsepower. Switching from grid search to `RandomizedSearchCV` and adding `hp` together moved the test MAE only a few hundred TL, which reinforces that the current feature set matters more than additional hyperparameter search at this stage. Notably, `min_child_samples` landed on the lower bound of the search range, which would normally suggest widening it, but the gains from further tuning are likely small.
+A LightGBM MAE of roughly `93k TL` is a meaningful improvement over the earlier `135k TL` result and reinforces a pattern that has held throughout the project: feature engineering moves the metric far more than hyperparameter tuning. Both tuning rounds on the smaller feature set produced sub-percent improvements, while parsing `hp` and `paint_changed` together cut MAE by roughly thirty percent.
 
-However, this error is still large enough that the bargain finder should be treated as a candidate generator, not as proof that a listing is underpriced. A high predicted discount may indicate a real bargain, but it can also come from missing features, rare models, unusual mileage, data quality issues, or model uncertainty.
-
-The current results suggest that more value may come from careful feature engineering than from heavier hyperparameter tuning. `paint_changed` is a likely next feature candidate, but it needs careful parsing because the strings mix changed panels, painted panels, local paint, fully original, fully painted, and unspecified values.
+This error is still large enough that the bargain finder should be treated as a candidate generator, not as proof that a listing is underpriced. A high predicted discount may indicate a real bargain, but it can also come from missing features, rare models, unusual mileage, data quality issues, or model uncertainty. The bargain finder now ranks listings by `discount_pct` (the predicted discount as a fraction of the predicted price) rather than by absolute Turkish lira, which prevents expensive luxury cars and EVs from dominating the top of the list purely because they have larger absolute prediction errors.
 
 ## Possible Next Steps
 
-- Parse `paint_changed` into structured features such as changed panel count, painted panel count, local painted panel count, fully original, fully painted, and unspecified.
-- Add confidence or uncertainty heuristics to the bargain ranking so very risky predictions are easier to spot.
-- Consider adding selected categorical fields only when they are likely to add stable signal.
+- Add the smaller categorical fields `body`, `fuel`, `transmission`, and `drive` as label-encoded features. Each is low-cardinality and clean and should give a few additional percent of MAE improvement.
+- Parse the free-text `model` column for trim level. Within a `brand_series`, trim often determines a large fraction of price (for example a base versus a top-trim engine variant), so this is the largest remaining unmodeled source of variance.
+- Add prediction intervals via quantile regression (training one LightGBM with `objective="quantile"` and `alpha=0.1` and another with `alpha=0.9`) so the bargain finder can prefer listings where the model is confident, rather than listings where the discount is large but the model is uncertain.
+- Re-run `RandomizedSearchCV` on the current eight-feature set to confirm the baseline LightGBM result cannot be improved much by tuning at this stage.
 
 ## Running the Project
 
