@@ -32,6 +32,10 @@ The current model uses the following feature set:
 - `degisen` (number of replaced panels)
 - `boyali` (number of painted panels)
 - `lokal_boyali` (number of locally painted panels)
+- `body_encoded`
+- `fuel_encoded`
+- `transmission_encoded`
+- `drive_encoded`
 
 `hp` is parsed from strings like `"110 hp"` and bucketed ranges like `"101 - 125 HP"` (arabam.com's fixed 25-hp buckets). Exact values are converted directly; range values are replaced with the midpoint. Open-ended ranges and placeholder values such as `"50 HP'ye kadar"`, `"601 HP ve üzeri"`, and `"-"` cannot be parsed cleanly and become `NaN`, which is then dropped.
 
@@ -52,37 +56,36 @@ The notebook currently:
 9. Parses `paint_changed` into `degisen`, `boyali`, and `lokal_boyali` count columns and drops rows with no information.
 10. Combines `brand` and `series` into `brand_series`.
 11. Label-encodes `brand_series` and `heavy_damage`.
-12. Splits the data into train and test sets with `random_state=42`.
-13. Trains baseline Decision Tree, XGBoost, and LightGBM regressors.
-14. Runs `RandomizedSearchCV` over LightGBM hyperparameters.
-15. Predicts expected prices and ranks listings by predicted discount in both absolute Turkish lira and as a percentage of the predicted price.
+12. Replaces `"-"` placeholder values with `NaN` in `body` and `drive`, drops rows missing any of `body`, `fuel`, `transmission`, or `drive`, then label-encodes all four.
+13. Splits the data into train and test sets with `random_state=42`.
+14. Trains baseline Decision Tree, XGBoost, and LightGBM regressors.
+15. Runs `RandomizedSearchCV` over LightGBM hyperparameters.
+16. Predicts expected prices and ranks listings by predicted discount in both absolute Turkish lira and as a percentage of the predicted price.
 
 ## Current Test Results
 
-The current metric is mean absolute error (MAE) in Turkish lira on the held-out test set. Lower is better.
-
-The current metric is mean absolute error (MAE) in Turkish lira on the held-out test set. Lower is better. The results below are with the full eight-feature set described above.
+The current metric is mean absolute error (MAE) in Turkish lira on the held-out test set. Lower is better. The results below are with the full twelve-feature set described above.
 
 | Model | Test MAE |
 | --- | ---: |
-| Decision Tree baseline | 144,875 TL |
-| XGBoost baseline | 103,872 TL |
-| LightGBM baseline | 93,334 TL |
+| LightGBM baseline (4 features) | 135,583 TL |
+| LightGBM baseline (8 features, adds `hp` and paint counts) | 93,334 TL |
+| LightGBM baseline (12 features, adds `body`, `fuel`, `transmission`, `drive`) | 86,696 TL |
 
-LightGBM is the strongest model. For reference, the same models trained earlier on a smaller four-feature set (without `hp` and the paint count columns) gave Decision Tree `169,626 TL`, XGBoost `145,543 TL`, and LightGBM `135,583 TL`. The roughly `42,000 TL` drop in LightGBM MAE from feature engineering alone was much larger than anything hyperparameter tuning produced on the smaller feature set, where a `RandomizedSearchCV` over LightGBM moved the MAE only a few hundred TL. The tuning has not yet been re-run on the larger feature set.
+LightGBM has been the strongest model at every stage of feature growth. The progression above tells the story of the project: each round of careful feature engineering moved the metric far more than hyperparameter tuning ever did. A `RandomizedSearchCV` over LightGBM on the original four-feature set moved the MAE by only a few hundred TL, while parsing `hp`, `paint_changed`, and adding the four small categoricals together cut MAE roughly in half. The tuning has not been re-run on the current twelve-feature set.
 
 ## Current Interpretation
 
-A LightGBM MAE of roughly `93k TL` is a meaningful improvement over the earlier `135k TL` result and reinforces a pattern that has held throughout the project: feature engineering moves the metric far more than hyperparameter tuning. Both tuning rounds on the smaller feature set produced sub-percent improvements, while parsing `hp` and `paint_changed` together cut MAE by roughly thirty percent.
+A LightGBM MAE of roughly `87k TL` is a meaningful improvement over the earlier `135k TL` result and reinforces a pattern that has held throughout the project: feature engineering moves the metric far more than hyperparameter tuning. Both tuning rounds on the smaller feature set produced sub-percent improvements, while parsing `hp`, parsing `paint_changed`, and adding the four small categoricals together cut MAE by roughly a third.
 
 This error is still large enough that the bargain finder should be treated as a candidate generator, not as proof that a listing is underpriced. A high predicted discount may indicate a real bargain, but it can also come from missing features, rare models, unusual mileage, data quality issues, or model uncertainty. The bargain finder now ranks listings by `discount_pct` (the predicted discount as a fraction of the predicted price) rather than by absolute Turkish lira, which prevents expensive luxury cars and EVs from dominating the top of the list purely because they have larger absolute prediction errors.
 
 ## Possible Next Steps
 
-- Add the smaller categorical fields `body`, `fuel`, `transmission`, and `drive` as label-encoded features. Each is low-cardinality and clean and should give a few additional percent of MAE improvement.
+- Build a small UI so the bargain finder can be browsed without opening the notebook.
 - Parse the free-text `model` column for trim level. Within a `brand_series`, trim often determines a large fraction of price (for example a base versus a top-trim engine variant), so this is the largest remaining unmodeled source of variance.
 - Add prediction intervals via quantile regression (training one LightGBM with `objective="quantile"` and `alpha=0.1` and another with `alpha=0.9`) so the bargain finder can prefer listings where the model is confident, rather than listings where the discount is large but the model is uncertain.
-- Re-run `RandomizedSearchCV` on the current eight-feature set to confirm the baseline LightGBM result cannot be improved much by tuning at this stage.
+- Re-run `RandomizedSearchCV` on the current twelve-feature set to confirm the baseline LightGBM result cannot be improved much by tuning at this stage.
 
 ## Running the Project
 
